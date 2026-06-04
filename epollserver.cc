@@ -50,6 +50,9 @@ struct Client {
     int pasvfd = -1;
     std::string readbuf;
     std::string writebuf;
+    bool active = false;
+    std::string IP;
+    uint16_t port = 0;
 };
 class Threadpool {
    public:
@@ -81,7 +84,9 @@ class ftpepollserver {
     void USER(int cfd, Client& client, std::string& user);
     void PASS(int cfd, Client& client, std::string& pass);
     void PASV(int cfd, Client& client);
+    void PORT(int cfd,Client&client,std::string arg);
     int acceptdata(Client& client);
+    int connectdata(Client& client);
     void LIST(int cfd, Client& client, std::string args);
     void RETR(int cfd, Client& client, std::string path1, std::string path2);
     void STOR(int cfd, Client& client, std::string path1, std::string path2);
@@ -277,9 +282,12 @@ void ftpepollserver::handle_read(int fd) {
             std::cout << "有一个客户端成功退出" << std::endl;
         } else if (!strcasecmp(cmd.c_str(), "pasv")) {
             PASV(fd, clients[fd]);
-        } else if (!strcasecmp(cmd.c_str(), "list")) {
-            pool.addtask([this, fd, arg]() { LIST(fd, clients[fd], arg); });
-        } else if (!strcasecmp(cmd.c_str(), "stor")) {
+        } else if (!strcasecmp(cmd.c_str(), "PORT")) {
+                       PORT(fd, clients[fd], arg);
+                   }
+            else if (!strcasecmp(cmd.c_str(), "list")) {
+                pool.addtask([this, fd, arg]() { LIST(fd, clients[fd], arg); });
+            } else if (!strcasecmp(cmd.c_str(), "stor")) {
             int pos = arg.find(' ');
             std::string s1 = arg.substr(0, pos);
             std::string s2 = arg.substr(pos + 1);
@@ -371,6 +379,7 @@ void ftpepollserver::PASS(int cfd, Client& client, std::string& pass) {
 
 void ftpepollserver::PASV(int cfd, Client& client) {
     closePASV(client);
+    client.active = false;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -397,15 +406,38 @@ void ftpepollserver::PASV(int cfd, Client& client) {
         std::to_string(p2) + ")\r\n";
     mod_epoll(cfd, EPOLLIN | EPOLLOUT | EPOLLET);
 }
-
+void ftpepollserver::PORT(int cfd,Client&client,std::string arg){
+    closePASV(client);
+    int h1, h2, h3, h4, p1, p2;
+    sscanf(arg.c_str(), "%d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2);
+    client.IP = std::to_string(h1) + "." + std::to_string(h2) + "." +
+                std::to_string(h3) + "." + std::to_string(h4);
+    client.port = p1 * 256 + p2;
+    client.active = true;
+    clients[cfd].writebuf += "200 PORT successful\r\n";
+    mod_epoll(cfd, EPOLLIN | EPOLLOUT | EPOLLET);
+}
 int ftpepollserver::acceptdata(Client& client) {
     int datafd = accept(client.pasvfd, nullptr, nullptr);
     closePASV(client);
     return datafd;
 }
-
+int ftpepollserver::connectdata(Client&client){
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(client.port);
+    inet_pton(AF_INET, client.IP.c_str(), &addr.sin_addr);
+    connect(fd, (sockaddr*)&addr, sizeof(addr));
+    return fd;
+}
 void ftpepollserver::LIST(int cfd, Client& client, std::string arg) {
-    int datafd = acceptdata(client);
+    int datafd;
+    if(client.active){
+        datafd = connectdata(client);
+    }else{
+        datafd = acceptdata(client);
+    }
     if (arg.empty()) {
         arg = ".";
     }
@@ -447,7 +479,12 @@ void ftpepollserver::RETR(int cfd,
         clients[cfd].writebuf += "222 file found\r\n";
         mod_epoll(cfd, EPOLLIN | EPOLLOUT | EPOLLET);
     }
-    int datafd = acceptdata(client);
+    int datafd;
+    if (client.active) {
+        datafd = connectdata(client);
+    } else {
+        datafd = acceptdata(client);
+    }
     char buf[4096];
     ssize_t n = 0;
     bool ok = true;
@@ -481,7 +518,12 @@ void ftpepollserver::STOR(int cfd,
         clients[cfd].writebuf += "222 open\r\n";
         mod_epoll(cfd, EPOLLIN | EPOLLOUT | EPOLLET);
     }
-    int datafd = acceptdata(client);
+    int datafd;
+    if (client.active) {
+        datafd = connectdata(client);
+    } else {
+        datafd = acceptdata(client);
+    }
     char buf[4096];
     ssize_t n = 0;
     bool ok = true;

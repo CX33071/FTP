@@ -31,12 +31,14 @@ class FTPClient {
     void RETR(std::string args);
     void STOR(std::string args);
     int PASV();
+    void PORT();
     void sendmessage(std::string cmd);
     int getcode(std::string line);
     bool prasePASV(std::string resp, std::string& ip, int& port);
     std::string getfilename(std::string& path);
     void getcmd(std::string& input, std::string& first, std::string& second);
-
+    int listenfd = -1;
+    bool active = false;
     Socket Client_;
 };
 
@@ -82,7 +84,7 @@ FTPClient::FTPClient(uint16_t port, std::string ip)
 
 void FTPClient::start() {
     login();
-    std::cout << "可用命令:PASV | LIST | RETR | STOR | QUIT\n";
+    std::cout << "可用命令:PASV | PORT | LIST | RETR | STOR | QUIT\n";
     std::string line;
     while (1) {
         std::cout << "ftp: " << std::endl;
@@ -101,6 +103,8 @@ void FTPClient::start() {
             if (datafd != -1) {
                 close(datafd);
             }
+        }else if(!strcasecmp(cmd.c_str(),"PORT")){
+            PORT();
         } else if (!strcasecmp(cmd.c_str(), "LIST")) {
             LIST(rest);
         } else if (!strcasecmp(cmd.c_str(), "RETR")) {
@@ -143,8 +147,16 @@ bool FTPClient::login() {
 }
 
 void FTPClient::LIST(std::string args) {
-    int datafd = PASV();
-    sendmessage("LIST " + args);
+    int datafd;
+    if(active){
+        sendmessage("LIST " + args);
+        datafd = accept(listenfd, nullptr, nullptr);
+        std::cout << "当前处于主动模式" << std::endl;
+    } else {
+        datafd = PASV();
+        sendmessage("LIST " + args);
+        std::cout << "当前处于被动模式" << std::endl;
+    }
     std::string resp = readline(Client_.fd());
     if (getcode(resp) == 550) {
         std::cout << "该目录不存在" << std::endl;
@@ -180,8 +192,16 @@ void FTPClient::RETR(std::string args) {
         std::cout << "本地文件创建失败！" << std::endl;
         return;
     }
-    int datafd = PASV();
-    sendmessage("RETR " + remote + " " + local);
+    int datafd;
+    if (active) {
+        sendmessage("RETR " + remote + " " + local);
+        datafd = accept(listenfd, nullptr, nullptr);
+        std::cout << "当前处于主动模式" << std::endl;
+    } else {
+        datafd = PASV();
+        sendmessage("RETR " + remote + " " + local);
+        std::cout << "当前处于被动模式" << std::endl;
+    }
     std::string resp = readline(Client_.fd());
     if (getcode(resp) == 550) {
         std::cout << "远程文件不存在!" << std::endl;
@@ -218,9 +238,17 @@ void FTPClient::STOR(std::string args) {
         std::perror("open");
         return;
     }
-    int datafd = PASV();
-    sendmessage("STOR " + local + " " + remote);
-    std::string resp = readline(Client_.fd());
+    int datafd;
+    if (active) {
+        sendmessage("STOR " + local + " " + remote);
+        datafd = accept(listenfd, nullptr, nullptr);
+        std::cout << "当前处于主动模式" << std::endl;
+    } else {
+        datafd = PASV();
+        sendmessage("STOR " + local + " " + remote);
+        std::cout << "当前处于被动模式" << std::endl;
+    }
+        std::string resp = readline(Client_.fd());
     if (getcode(resp) == 550) {
         std::cout << "远程文件创建失败!" << std::endl;
         return;
@@ -244,6 +272,11 @@ void FTPClient::STOR(std::string args) {
 }
 
 int FTPClient::PASV() {
+    if(listenfd!=-1){
+        close(listenfd);
+        listenfd = -1;
+    }
+    active = false;
     sendmessage("PASV");
     std::string resp = readline(Client_.fd());
     std::string ip;
@@ -255,10 +288,41 @@ int FTPClient::PASV() {
     addr.sin_port = htons(static_cast<uint16_t>(port));
     inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
     connect(datafd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    std::cout << "数据通道已经连接成功\n";
+    std::cout << "被动模式打开\n";
     return datafd;
 }
+void FTPClient::PORT(){
+    
+     listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;
+    bind(listenfd, (sockaddr*)&addr, sizeof(addr));
+    listen(listenfd, 1);
+    socklen_t len = sizeof(addr);
+    getsockname(listenfd, (sockaddr*)&addr, &len);
+    uint16_t port = ntohs(addr.sin_port);
+    sockaddr_in local{};
+    len = sizeof(local);
+    getsockname(Client_.fd(), (sockaddr*)&local, &len);
+    unsigned char* ip = (unsigned char*)&local.sin_addr.s_addr;
+    int p1 = port / 256;
+    int p2 = port % 256;
+    std::string cmd = "PORT " + std::to_string(ip[0]) + "," +
+                      std::to_string(ip[1]) + "," + std::to_string(ip[2]) +
+                      "," + std::to_string(ip[3]) + "," + std::to_string(p1) +
+                      "," + std::to_string(p2);
 
+    sendmessage(cmd);
+    std::string resp = readline(Client_.fd());
+    if (getcode(resp) != 200) {
+        std::cout << "PORT失败\n";
+        return;
+    }
+    active = true;
+    std::cout << "主动模式已开启!" << std::endl;
+}
 void FTPClient::sendmessage(std::string cmd) {
     std::string line = cmd + "\r\n";
     if (!sendn(Client_.fd(), line.data(), line.size())) {
